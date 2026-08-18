@@ -12,8 +12,9 @@ use auth::{Auth, LoginOptions, load_or_login, login_with_browser};
 use cannjudge::{
   SubmitOptions, download_submission_package, download_template_package, fetch_contest_problems,
   fetch_problem, fetch_ranking, fetch_ranking_by_ranks, fetch_ranking_pages, fetch_remote_history,
-  fetch_submission, fetch_template, parse_rank_selectors, parse_submission_id, raw_api,
-  resolve_contest, resolve_problem, submit_local, watch_submission, write_template_dir,
+  fetch_submission, fetch_submission_quota, fetch_template, parse_rank_selectors,
+  parse_submission_id, raw_api, resolve_contest, resolve_problem, submit_local, watch_submission,
+  write_template_dir,
 };
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use client::ApiClient;
@@ -32,11 +33,20 @@ struct Cli {
   #[arg(long, env = "CANNJUDGE_BASE_URL", default_value = config::DEFAULT_BASE_URL)]
   base_url: String,
 
-  #[arg(long, default_value_t = config::default_auth_cache())]
-  auth_cache: String,
+  /// Named credential profile. Profiles are stored independently.
+  #[arg(
+    long,
+    global = true,
+    env = "CANNJUDGE_ACCOUNT",
+    default_value_t = config::default_account()
+  )]
+  account: String,
 
-  #[arg(long, default_value_t = config::default_state_file())]
-  state_file: String,
+  #[arg(long, global = true)]
+  auth_cache: Option<String>,
+
+  #[arg(long, global = true)]
+  state_file: Option<String>,
 
   #[arg(long, default_value_t = config::default_cache_dir())]
   cache_dir: String,
@@ -50,14 +60,14 @@ struct Cli {
   #[arg(long, global = true, default_value_t = 3600)]
   cache_ttl: u64,
 
-  #[arg(long, default_value_t = config::default_cdp_list_url())]
-  cdp_list_url: String,
+  #[arg(long, global = true)]
+  cdp_list_url: Option<String>,
 
-  #[arg(long, default_value_t = config::default_chrome_bin())]
-  chrome_bin: String,
+  #[arg(long, global = true)]
+  chrome_bin: Option<String>,
 
-  #[arg(long, default_value_t = config::default_chrome_profile())]
-  chrome_profile: String,
+  #[arg(long, global = true)]
+  chrome_profile: Option<String>,
 
   #[arg(long, global = true)]
   json: bool,
@@ -72,12 +82,14 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
   Auth(AuthCommand),
+  Accounts(AccountsCommand),
   Problem(ProblemCommand),
   Contest(ContestCommand),
   Submit(SubmitCommand),
   Submission(SubmissionCommand),
   History(HistoryCommand),
   Ranking(RankingCommand),
+  Quota(QuotaCommand),
   Api(ApiCommand),
 }
 
@@ -99,6 +111,18 @@ enum AuthSubcommand {
   },
   Status,
   Logout,
+}
+
+#[derive(Args)]
+struct AccountsCommand {
+  #[command(subcommand)]
+  command: AccountsSubcommand,
+}
+
+#[derive(Subcommand)]
+enum AccountsSubcommand {
+  /// List configured accounts and their cached login state.
+  List,
 }
 
 #[derive(Args)]
@@ -223,6 +247,9 @@ struct RankingCommand {
 }
 
 #[derive(Args)]
+struct QuotaCommand {}
+
+#[derive(Args)]
 struct ApiCommand {
   method: ApiMethod,
   path: String,
@@ -246,27 +273,46 @@ fn main() -> Result<()> {
 }
 
 fn run(cli: Cli) -> Result<()> {
+  config::validate_account_name(&cli.account)?;
   match &cli.command {
     Command::Auth(command) => run_auth(&cli, command),
+    Command::Accounts(command) => run_accounts(command),
     Command::Problem(command) => run_problem(&cli, command),
     Command::Contest(command) => run_contest(&cli, command),
     Command::Submit(command) => run_submit(&cli, command),
     Command::Submission(command) => run_submission(&cli, command),
     Command::History(command) => run_history(&cli, command),
     Command::Ranking(command) => run_ranking(&cli, command),
+    Command::Quota(command) => run_quota(&cli, command),
     Command::Api(command) => run_api(&cli, command),
   }
 }
 
+fn run_accounts(command: &AccountsCommand) -> Result<()> {
+  match &command.command {
+    AccountsSubcommand::List => {
+      for account in config::list_accounts() {
+        let path = config::account_auth_cache(&account)?;
+        let marker = match Auth::load(&path) {
+          Ok(auth) => format!("logged in as {} ({})", auth.user_label(), auth.user_id()),
+          Err(_) => "not logged in".to_string(),
+        };
+        println!("{account}: {marker} [{}]", path.display());
+      }
+      Ok(())
+    }
+  }
+}
+
 fn run_auth(cli: &Cli, command: &AuthCommand) -> Result<()> {
-  let auth_path = config::expand_tilde(&cli.auth_cache);
+  let auth_path = auth_path(cli)?;
   match &command.command {
     AuthSubcommand::Login {
       force,
       no_launch,
       timeout,
     } => {
-      let mut options = login_options(cli);
+      let mut options = login_options(cli)?;
       options.no_launch = *no_launch;
       options.login_timeout = Duration::from_secs(*timeout);
       let auth = if *force {
@@ -360,7 +406,7 @@ fn run_submit(cli: &Cli, command: &SubmitCommand) -> Result<()> {
     },
   )?;
 
-  let state_path = config::expand_tilde(&cli.state_file);
+  let state_path = state_path(cli)?;
   let mut state = State::load(&state_path);
   state.record_submission(LocalSubmission::new(
     outcome.submission_id.clone(),
@@ -446,7 +492,7 @@ fn run_submission(cli: &Cli, command: &SubmissionCommand) -> Result<()> {
 fn run_history(cli: &Cli, command: &HistoryCommand) -> Result<()> {
   let mut client = client(cli, command.mine)?;
   let problem = resolve_problem(&mut client, &command.problem)?;
-  let state = State::load(&config::expand_tilde(&cli.state_file));
+  let state = State::load(&state_path(cli)?);
   let local = if command.remote_only {
     Vec::new()
   } else {
@@ -514,6 +560,12 @@ fn run_ranking(cli: &Cli, command: &RankingCommand) -> Result<()> {
   )
 }
 
+fn run_quota(cli: &Cli, _command: &QuotaCommand) -> Result<()> {
+  let mut client = client(cli, true)?;
+  let quota = fetch_submission_quota(&mut client)?;
+  output::print_submission_quota(&quota, &cli.account, cli.json)
+}
+
 fn run_api(cli: &Cli, command: &ApiCommand) -> Result<()> {
   let mut client = client(cli, command.auth)?;
   let method = match command.method {
@@ -532,9 +584,9 @@ fn run_api(cli: &Cli, command: &ApiCommand) -> Result<()> {
 }
 
 fn client(cli: &Cli, auth_required: bool) -> Result<ApiClient> {
-  let auth_path = config::expand_tilde(&cli.auth_cache);
+  let auth_path = auth_path(cli)?;
   let auth = if auth_required {
-    let options = login_options(cli);
+    let options = login_options(cli)?;
     Some(load_or_login(&options, false)?)
   } else {
     Auth::load(&auth_path).ok()
@@ -551,18 +603,44 @@ fn client(cli: &Cli, auth_required: bool) -> Result<ApiClient> {
   ApiClient::new(cli.base_url.clone(), auth, Some(auth_path), cache)
 }
 
-fn login_options(cli: &Cli) -> LoginOptions {
-  LoginOptions {
+fn login_options(cli: &Cli) -> Result<LoginOptions> {
+  let account = config::validate_account_name(&cli.account)?;
+  Ok(LoginOptions {
     base_url: cli.base_url.clone(),
-    cdp_list_url: cli.cdp_list_url.clone(),
-    chrome_bin: cli.chrome_bin.clone(),
-    chrome_profile: config::expand_tilde(&cli.chrome_profile),
-    auth_cache: config::expand_tilde(&cli.auth_cache),
+    cdp_list_url: cli
+      .cdp_list_url
+      .clone()
+      .unwrap_or(config::account_cdp_list_url(&account)?),
+    chrome_bin: cli
+      .chrome_bin
+      .clone()
+      .unwrap_or_else(config::default_chrome_bin),
+    chrome_profile: cli
+      .chrome_profile
+      .as_deref()
+      .map(config::expand_tilde)
+      .unwrap_or(config::account_chrome_profile(&account)?),
+    auth_cache: auth_path(cli)?,
     no_launch: false,
     login_timeout: Duration::from_secs(300),
     probe_interval: Duration::from_secs(2),
     debug: cli.debug,
+  })
+}
+
+fn auth_path(cli: &Cli) -> Result<PathBuf> {
+  if let Some(path) = &cli.auth_cache {
+    return Ok(config::expand_tilde(path));
   }
+  config::account_auth_cache(&cli.account)
+}
+
+fn state_path(cli: &Cli) -> Result<PathBuf> {
+  if let Some(path) = &cli.state_file {
+    return Ok(config::expand_tilde(path));
+  }
+  config::account_state_file(&cli.account)
+    .or_else(|_| Ok(config::expand_tilde(config::default_state_file())))
 }
 
 fn write_submission_code(value: &Value, out: &PathBuf) -> Result<usize> {

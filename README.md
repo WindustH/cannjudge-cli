@@ -26,12 +26,51 @@ the CLI then saves credentials to:
 ${XDG_CONFIG_HOME:-~/.config}/cannjudge-cli/auth.json
 ```
 
+The browser profile is kept in the cache directory:
+
+```text
+${XDG_CACHE_HOME:-~/.cache}/cannjudge-cli/chrome-profile
+```
+
+Accounts are independent. Select one with `--account` (or `CANNJUDGE_ACCOUNT`):
+
+```bash
+cannjudge accounts list
+cannjudge --account default auth login
+cannjudge --account work auth login
+cannjudge --account work problem info https://cannjudge.cn/public/s1/addcmul
+cannjudge --account work auth status
+```
+
+Every account gets its own auth cache, Chrome profile, and Chrome DevTools port.
+The CDP port is selected at runtime from `61600–61799` and persisted in the
+account config. Let the CLI manage this port per account.
+
+Removing the Chrome profile only requires logging in again; the auth cache remains
+under the config directory.
+
 Useful auth commands:
 
 ```bash
 cannjudge auth status
 cannjudge auth logout
 ```
+
+## Daily submission quota
+
+Query the selected account's submissions for the current Beijing calendar day.
+The daily limit is 50 submissions and resets at 00:00 Beijing time. The command
+always fetches the submission list from CANNJudge instead of using the GET cache:
+
+```bash
+cannjudge --account default quota
+cannjudge --account work quota
+cannjudge --account work --json quota
+```
+
+Use `accounts list` to see which named accounts are available, then select the
+same account with `--account` for quota checks and submissions. The JSON result
+contains `used_today`, `daily_limit`, and `remaining_today`.
 
 ## Problems
 
@@ -207,7 +246,7 @@ rank data is cached together instead of requesting one row at a time.
 GET JSON responses are cached by default in:
 
 ```text
-.cache/cannjudge-cli
+${XDG_CACHE_HOME:-~/.cache}/cannjudge-cli
 ```
 
 Use this to reduce repeated requests to CANNJudge. POST submissions, zip downloads,

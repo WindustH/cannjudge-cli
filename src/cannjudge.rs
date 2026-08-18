@@ -2,6 +2,7 @@ use crate::auth::is_object_id;
 use crate::client::{ApiClient, downcast_api_error, ensure_auth};
 use crate::util::{object_id, safe_join, value_string};
 use anyhow::{Context, Result, anyhow, bail};
+use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, Utc};
 use reqwest::Method;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -59,6 +60,152 @@ pub struct SubmitOutcome {
   pub submission_id: String,
   pub response: Value,
   pub queued_wait_seconds: u64,
+}
+
+pub const DAILY_SUBMISSION_LIMIT: usize = 50;
+pub const BEIJING_UTC_OFFSET_SECONDS: i32 = 8 * 60 * 60;
+const QUOTA_PAGE_SIZE: usize = 50;
+
+#[derive(Clone, Debug, Serialize)]
+pub struct SubmissionQuota {
+  pub user_id: String,
+  pub beijing_date: String,
+  pub used_today: usize,
+  pub daily_limit: usize,
+  pub remaining_today: usize,
+  pub total_submissions: Option<usize>,
+  pub scanned_submissions: usize,
+  pub reset_timezone: &'static str,
+  pub reset_time: &'static str,
+}
+
+pub fn fetch_submission_quota(client: &mut ApiClient) -> Result<SubmissionQuota> {
+  let user_id = ensure_auth(client)?;
+  let today = beijing_today();
+  let mut skip = 0usize;
+  let mut used_today = 0usize;
+  let mut scanned_submissions = 0usize;
+  let mut total_submissions = None;
+
+  loop {
+    let page = client.get_json_fresh(
+      &format!("/api/submissions/user/{user_id}"),
+      &[
+        ("withCount", "1".to_string()),
+        ("skip", skip.to_string()),
+        ("limit", QUOTA_PAGE_SIZE.to_string()),
+        ("order", "desc".to_string()),
+        ("strict", "1".to_string()),
+      ],
+    )?;
+    if total_submissions.is_none() {
+      total_submissions = json_usize(&page, "total");
+    }
+    let rows = submission_rows(&page);
+    if rows.is_empty() {
+      break;
+    }
+    scanned_submissions += rows.len();
+    let (page_used_today, saw_older_submission) = count_submission_rows(&rows, today);
+    used_today += page_used_today;
+
+    let next_skip = skip.saturating_add(rows.len());
+    if saw_older_submission {
+      break;
+    }
+    let has_more = total_submissions
+      .map(|total| next_skip < total)
+      .unwrap_or(rows.len() >= QUOTA_PAGE_SIZE);
+    if !has_more || next_skip <= skip {
+      break;
+    }
+    skip = next_skip;
+  }
+
+  Ok(SubmissionQuota {
+    user_id,
+    beijing_date: today.to_string(),
+    used_today,
+    daily_limit: DAILY_SUBMISSION_LIMIT,
+    remaining_today: DAILY_SUBMISSION_LIMIT.saturating_sub(used_today),
+    total_submissions,
+    scanned_submissions,
+    reset_timezone: "Asia/Shanghai",
+    reset_time: "00:00",
+  })
+}
+
+fn beijing_today() -> NaiveDate {
+  Utc::now().with_timezone(&beijing_offset()).date_naive()
+}
+
+fn beijing_offset() -> FixedOffset {
+  FixedOffset::east_opt(BEIJING_UTC_OFFSET_SECONDS).expect("valid Beijing UTC offset")
+}
+
+fn submission_rows(value: &Value) -> Vec<&Value> {
+  if let Some(rows) = value.as_array() {
+    return rows.iter().collect();
+  }
+  value
+    .get("list")
+    .or_else(|| value.get("rows"))
+    .or_else(|| value.pointer("/data/list"))
+    .and_then(Value::as_array)
+    .map(|rows| rows.iter().collect())
+    .unwrap_or_default()
+}
+
+fn json_usize(value: &Value, key: &str) -> Option<usize> {
+  value
+    .get(key)
+    .and_then(Value::as_u64)
+    .map(|number| number as usize)
+    .or_else(|| value.get(key).and_then(Value::as_str)?.parse().ok())
+}
+
+fn submission_beijing_date(value: &Value) -> Option<NaiveDate> {
+  let raw = value_string(
+    value,
+    &[
+      "create_time",
+      "createTime",
+      "created_at",
+      "createdAt",
+      "submit_time",
+      "submitTime",
+    ],
+  );
+  parse_beijing_date(&raw)
+}
+
+fn count_submission_rows(rows: &[&Value], today: NaiveDate) -> (usize, bool) {
+  let mut used_today = 0usize;
+  let mut saw_older_submission = false;
+  for row in rows {
+    match submission_beijing_date(row) {
+      Some(date) if date == today => used_today += 1,
+      Some(date) if date < today => saw_older_submission = true,
+      _ => {}
+    }
+  }
+  (used_today, saw_older_submission)
+}
+
+fn parse_beijing_date(raw: &str) -> Option<NaiveDate> {
+  let raw = raw.trim();
+  if raw.is_empty() {
+    return None;
+  }
+  if let Ok(timestamp) = DateTime::parse_from_rfc3339(raw) {
+    return Some(timestamp.with_timezone(&beijing_offset()).date_naive());
+  }
+  for format in ["%Y-%m-%d %H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S%.f"] {
+    if let Ok(timestamp) = NaiveDateTime::parse_from_str(raw, format) {
+      return Some(timestamp.date());
+    }
+  }
+  NaiveDate::parse_from_str(raw, "%Y-%m-%d").ok()
 }
 
 pub fn resolve_problem(client: &mut ApiClient, input: &str) -> Result<ProblemRef> {
@@ -1008,4 +1155,37 @@ pub fn raw_api(
   data: Option<Value>,
 ) -> Result<Value> {
   client.request_json(method, path, &[], data)
+}
+
+#[cfg(test)]
+mod tests {
+  use super::{count_submission_rows, parse_beijing_date};
+  use chrono::NaiveDate;
+  use serde_json::json;
+
+  #[test]
+  fn quota_uses_beijing_midnight_for_rfc3339_timestamps() {
+    assert_eq!(
+      parse_beijing_date("2026-08-08T15:59:59.999Z"),
+      Some(NaiveDate::from_ymd_opt(2026, 8, 8).unwrap())
+    );
+    assert_eq!(
+      parse_beijing_date("2026-08-08T16:00:00.000Z"),
+      Some(NaiveDate::from_ymd_opt(2026, 8, 9).unwrap())
+    );
+  }
+
+  #[test]
+  fn quota_counts_today_and_stops_after_an_older_row() {
+    let rows = [
+      json!({"create_time": "2026-08-09T02:00:00Z"}),
+      json!({"create_time": "2026-08-08T16:00:00Z"}),
+      json!({"create_time": "2026-08-08T15:59:59Z"}),
+    ];
+    let references = rows.iter().collect::<Vec<_>>();
+    assert_eq!(
+      count_submission_rows(&references, NaiveDate::from_ymd_opt(2026, 8, 9).unwrap()),
+      (2, true)
+    );
+  }
 }

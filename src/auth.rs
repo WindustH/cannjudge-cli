@@ -102,7 +102,7 @@ impl Auth {
       .filter(|cookie| {
         !cookie_expired(cookie, 0.0)
           && domain_matches(&cookie.domain, host)
-          && path.starts_with(cookie.path.trim_end_matches('/'))
+          && path_matches(&cookie.path, path)
       })
       .collect();
     selected.sort_by_key(|cookie| std::cmp::Reverse(cookie.path.len()));
@@ -181,6 +181,22 @@ pub fn domain_matches(cookie_domain: &str, host: &str) -> bool {
   }
 }
 
+pub fn path_matches(cookie_path: &str, request_path: &str) -> bool {
+  let cookie_path = if cookie_path.is_empty() {
+    "/"
+  } else {
+    cookie_path
+  };
+  if cookie_path == "/" {
+    return true;
+  }
+  let cookie_path = cookie_path.trim_end_matches('/');
+  request_path == cookie_path
+    || request_path
+      .strip_prefix(cookie_path)
+      .is_some_and(|rest| rest.starts_with('/'))
+}
+
 pub fn cookie_expired(cookie: &Cookie, margin: f64) -> bool {
   match cookie.expires {
     None => false,
@@ -226,11 +242,11 @@ fn parse_set_cookie(url: &str, raw: &str) -> Option<Cookie> {
   let mut parts = raw.split(';').map(str::trim);
   let first = parts.next()?;
   let (name, value) = first.split_once('=')?;
-  if name.is_empty() || value.is_empty() {
+  if name.trim().is_empty() {
     return None;
   }
   let mut cookie = Cookie {
-    name: name.to_string(),
+    name: name.trim().to_string(),
     value: value.to_string(),
     domain: host,
     path: "/".to_string(),
@@ -318,15 +334,16 @@ fn ensure_chrome(options: &LoginOptions, login_url: &str) -> Result<Option<Child
   }
 
   if options.no_launch {
+    let port = cdp_port(&options.cdp_list_url).unwrap_or(config::CDP_PORT_POOL_START);
     bail!(
-      "Chrome DevTools is not available at {}; start Chrome with --remote-debugging-port=9222 or omit --no-launch",
-      options.cdp_list_url
+      "Chrome DevTools is not available at {}; start Chrome with --remote-debugging-port={port} or omit --no-launch",
+      options.cdp_list_url,
     );
   }
 
   std::fs::create_dir_all(&options.chrome_profile)
     .with_context(|| format!("create {}", options.chrome_profile.display()))?;
-  let port = cdp_port(&options.cdp_list_url).unwrap_or(9222);
+  let port = cdp_port(&options.cdp_list_url).unwrap_or(config::CDP_PORT_POOL_START);
   let child = Command::new(&options.chrome_bin)
     .arg(format!("--remote-debugging-port={port}"))
     .arg(format!(
@@ -457,5 +474,26 @@ impl Default for LoginOptions {
       probe_interval: Duration::from_secs(2),
       debug: false,
     }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::{domain_matches, path_matches};
+
+  #[test]
+  fn cookie_path_requires_a_segment_boundary() {
+    assert!(path_matches("/api", "/api"));
+    assert!(path_matches("/api", "/api/items"));
+    assert!(!path_matches("/api", "/apix"));
+  }
+
+  #[test]
+  fn cookie_domain_matching_is_subdomain_aware() {
+    assert!(domain_matches(".cannjudge.cn", "api.cannjudge.cn"));
+    assert!(!domain_matches(
+      ".cannjudge.cn",
+      "cannjudge.cn.evil.example"
+    ));
   }
 }

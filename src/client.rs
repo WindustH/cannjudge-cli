@@ -86,6 +86,10 @@ impl ApiClient {
     self.request_json(Method::GET, path, query, None)
   }
 
+  pub fn get_json_fresh(&mut self, path: &str, query: &[(&str, String)]) -> Result<Value> {
+    self.request_json_inner(Method::GET, path, query, None, false)
+  }
+
   pub fn post_json(&mut self, path: &str, data: Value) -> Result<Value> {
     self.request_json(Method::POST, path, &[], Some(data))
   }
@@ -97,8 +101,21 @@ impl ApiClient {
     query: &[(&str, String)],
     data: Option<Value>,
   ) -> Result<Value> {
+    self.request_json_inner(method, path, query, data, true)
+  }
+
+  fn request_json_inner(
+    &mut self,
+    method: Method,
+    path: &str,
+    query: &[(&str, String)],
+    data: Option<Value>,
+    use_cache: bool,
+  ) -> Result<Value> {
     let url = self.url(path, query)?;
-    let cache = self.cache_candidate(&method, &url, data.is_none());
+    let cache = use_cache
+      .then(|| self.cache_candidate(&method, &url, data.is_none()))
+      .flatten();
     if let Some(cache) = &cache
       && let Some(value) = self.read_cached_json(cache)?
     {
@@ -302,19 +319,32 @@ fn parse_download_filename(disposition: Option<&str>) -> Option<String> {
   {
     return urlencoding::decode(value.as_str())
       .ok()
-      .map(|value| value.into_owned());
+      .and_then(|value| safe_download_filename(&value));
   }
   let re_quoted = regex::Regex::new(r#"(?i)filename\s*=\s*"([^"]+)""#).ok()?;
   if let Some(captures) = re_quoted.captures(raw)
     && let Some(value) = captures.get(1)
   {
-    return Some(value.as_str().to_string());
+    return safe_download_filename(value.as_str());
   }
   let re_plain = regex::Regex::new(r#"(?i)filename\s*=\s*([^;]+)"#).ok()?;
   re_plain
     .captures(raw)
     .and_then(|captures| captures.get(1))
-    .map(|value| value.as_str().trim().to_string())
+    .and_then(|value| safe_download_filename(value.as_str().trim()))
+}
+
+fn safe_download_filename(value: &str) -> Option<String> {
+  let normalized = value.replace('\\', "/");
+  let name = std::path::Path::new(&normalized)
+    .file_name()
+    .and_then(|name| name.to_str())?
+    .trim();
+  if name.is_empty() || name == "." || name == ".." || name.contains('\0') {
+    None
+  } else {
+    Some(name.to_string())
+  }
 }
 
 pub fn downcast_api_error(error: &anyhow::Error) -> Option<&ApiError> {
@@ -385,4 +415,23 @@ fn is_terminal_status(status: &str) -> bool {
     || status == "queued"
     || status == "judging"
     || status == "compiling")
+}
+
+#[cfg(test)]
+mod tests {
+  use super::parse_download_filename;
+
+  #[test]
+  fn download_filename_cannot_escape_destination() {
+    assert_eq!(
+      parse_download_filename(Some(r#"attachment; filename="../../result.zip""#)),
+      Some("result.zip".to_string())
+    );
+    assert_eq!(
+      parse_download_filename(Some(
+        r#"attachment; filename*=UTF-8''%E6%B5%8B%E8%AF%95.zip"#
+      )),
+      Some("测试.zip".to_string())
+    );
+  }
 }

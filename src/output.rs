@@ -1,5 +1,5 @@
 use crate::auth::Auth;
-use crate::cannjudge::{ContestRef, ProblemRef};
+use crate::cannjudge::{ContestRef, ProblemRef, SubmissionQuota};
 use crate::state::LocalSubmission;
 use crate::util::{print_json, truncate, value_string};
 use anyhow::Result;
@@ -16,6 +16,25 @@ pub fn print_auth(auth: &Auth, json_output: bool) -> Result<()> {
   }
   println!("source: {}", auth.source);
   println!("cookies: {}", auth.cookies.len());
+  Ok(())
+}
+
+pub fn print_submission_quota(
+  quota: &SubmissionQuota,
+  account: &str,
+  json_output: bool,
+) -> Result<()> {
+  if json_output {
+    let mut value = serde_json::to_value(quota)?;
+    value["account"] = Value::String(account.to_string());
+    return print_json(&value);
+  }
+  println!("account: {account}");
+  println!("user_id: {}", quota.user_id);
+  println!("beijing_date: {}", quota.beijing_date);
+  println!("used_today: {}/{}", quota.used_today, quota.daily_limit);
+  println!("remaining_today: {}", quota.remaining_today);
+  println!("reset: {} {}", quota.reset_timezone, quota.reset_time);
   Ok(())
 }
 
